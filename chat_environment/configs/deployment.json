@@ -1,0 +1,22 @@
+[
+    {
+        "name": "chat_environment_deployment_1",
+        "module": {"name": "chat_environment"},
+        "node": {"ip": "localhost"},
+        "config": {
+            "max_rounds": 5,
+            "initial_topic": "Initial Market Discussion",
+            "sub_rounds": 3,
+            "group_size": 5,
+            "storage_config": {
+                "storage_type": "db",
+                "path": "chat_environment",
+                "schema": {
+                    "run_id": {"type": "text", "primary_key": true},
+                    "messages": {"type": "jsonb"}  
+                },
+                "options": null
+            }
+        }
+    }
+]
