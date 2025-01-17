@@ -1,39 +1,63 @@
 #!/usr/bin/env python
 from dotenv import load_dotenv
-from typing import Dict
-from naptha_sdk.schemas import AgentRunInput
+from pydantic import BaseModel, Field
+from typing import Dict, List, Any, Union, Optional
+from market_agents.environments.environment import (
+    LocalAction, GlobalAction, LocalObservation, GlobalObservation,
+    EnvironmentStep, ActionSpace, ObservationSpace, LocalEnvironmentStep, EnvironmentHistory
+)
+from naptha_sdk.storage.schemas import CreateStorageRequest, DeleteStorageRequest, ListStorageRequest
+from naptha_sdk.storage.storage_provider import StorageProvider
+from naptha_sdk.schemas import EnvironmentDeployment, EnvironmentRunInput
 from naptha_sdk.user import sign_consumer_id
 from naptha_sdk.utils import get_logger
-from chat_environment.schemas import InputSchema
+from chat_environment.schemas import InputSchema, ChatInputMessage, ChatObservation
 
 load_dotenv()
 
 logger = get_logger(__name__)
 
-class ChatMechanism(BaseModel):
-    max_rounds: int = Field(default=1000, description="Maximum number of simulation rounds")
-    current_round: int = Field(default=0, description="Current round number") 
-    sequential: bool = Field(default=False, description="Whether the mechanism is sequential")
-    messages: List[DiscordInputMessage] = Field(default_factory=list)
-    global_state: Dict[str, Any] = Field(default_factory=dict)  # Add global_state field
+class ChatMechanism():
+    def __init__(self, deployment: Dict[str, Any]):
+        self.deployment = deployment
+        self.config = self.deployment.config
+        self.messages = []
+        self.max_rounds = self.deployment.config.max_rounds
+        self.current_round = True
+        self.sequential = False
+        self.storage_provider = StorageProvider(self.deployment.node)
+        self.storage_type = self.config.storage_config.storage_type
+        self.table_name = self.config.storage_config.path
+        self.schema = self.config.storage_config.schema
 
-    def step(self, action: Union[DiscordAction, Dict[str, Any]]) -> Union[LocalEnvironmentStep, EnvironmentStep]:
+    async def list_rows(self, input_data: Dict[str, Any] = None, *args, **kwargs):
+        list_storage_request = ListStorageRequest(
+            storage_type=self.storage_type,
+            path=self.table_name,
+            options={"limit": input_data['limit'] if input_data and 'limit' in input_data else None}
+        )
+        list_storage_result = await self.storage_provider.execute(list_storage_request)
+        logger.info(f"List rows result: {list_storage_result}")
+        return {"status": "success", "message": f"List rows result: {list_storage_result}"}
+
+
+    def step(self, action: Union[LocalAction, Dict[str, Any]]) -> Union[LocalEnvironmentStep, EnvironmentStep]:
         """
         Process the agent's action, update the mechanism's state, and return observations.
         """
-        logger.debug(f"DiscordMechanism step called with action: {action}")
+        logger.debug(f"ChatMechanism step called with action: {action}")
 
         if isinstance(action, dict):
             try:
-                action = DiscordAction.parse_obj(action)
-                logger.debug("Parsed action into DiscordAction.")
+                action = LocalAction.parse_obj(action)
+                logger.debug("Parsed action into LocalAction.")
             except Exception as e:
-                logger.error(f"Failed to parse action into DiscordAction: {e}")
+                logger.error(f"Failed to parse action into LocalAction: {e}")
                 raise
 
-        if not isinstance(action, DiscordAction):
-            logger.error(f"Expected DiscordAction, got {type(action).__name__}")
-            raise TypeError(f"Expected DiscordAction, got {type(action).__name__}")
+        if not isinstance(action, LocalAction):
+            logger.error(f"Expected LocalAction, got {type(action).__name__}")
+            raise TypeError(f"Expected LocalAction, got {type(action).__name__}")
 
         # Process the action
         self.current_round += 1
@@ -70,68 +94,77 @@ class ChatMechanism(BaseModel):
 
         return local_step
     
-    def _calculate_reward(self, action: DiscordAction) -> float:
+    def _calculate_reward(self, action: LocalAction) -> float:
         """Calculate reward based on action content."""
         # Return 1.0 if action has content, 0.0 otherwise
         if action and action.action and action.action.content:
             return 1.0
         return 0.0
 
-    def _create_observation(self, agent_id: str) -> DiscordLocalObservation:
+    def _create_observation(self, agent_id: str) -> LocalObservation:
         """
         Create a local observation for the agent, including only their own messages.
         """
         # Filter messages sent by the agent
         agent_messages = [msg for msg in self.messages if msg.author_id == agent_id]
 
-        observation = DiscordObservation(messages=agent_messages)
-        local_observation = DiscordLocalObservation(
+        observation = ChatObservation(messages=agent_messages)
+        local_observation = LocalObservation(
             agent_id=agent_id,
             observation=observation
         )
         return local_observation
 
-    def update_state(self, environment_info: Dict[str, Any]) -> None:
+    async def update_state(self, environment_info: Dict[str, Any]) -> None:
         """
         Update the mechanism's state with new environment information.
-        This method should be called whenever new messages are received from Discord.
+        This method should be called whenever new messages are received from chat.
         """
         # Update global state
         self.global_state = environment_info
 
         # Update messages
         messages = environment_info.get("messages", [])
-        self.messages = [
-            DiscordInputMessage(
+        messages = [
+            ChatInputMessage(
                 content=msg["content"],
-                message_type="user_message" if msg["author_id"] != environment_info["bot_id"] else "agent_message",
-                author_id=msg["author_id"],
-                author_name=msg["author_name"],
-                channel_id=environment_info["channel_id"],
-                channel_name=environment_info["channel_name"],
+                role="user",
+                user_id=msg["user_id"],
                 timestamp=msg["timestamp"]
-            )
+            ).model_dump()
             for msg in messages
         ]
-        logger.info(f"Updated mechanism state with {len(self.messages)} messages")
 
-    def get_global_state(self) -> Dict[str, Any]:
+        create_row_result = await self.storage_provider.execute(CreateStorageRequest(
+            storage_type=self.storage_type,
+            path=self.table_name,
+            data={"data": messages[0]}
+        ))
+
+        logger.info(f"Create row result: {create_row_result}")
+
+        logger.info(f"Updated mechanism state with {len(messages)} messages")
+
+    async def get_global_state(self) -> Dict[str, Any]:
         """
         Return the global state as a dictionary.
         """
         # Create local observations for each agent
+
+        result = await self.list_rows()
+        
         local_observations = {}
         for message in self.messages:
             agent_id = message.author_id
             if agent_id not in local_observations:
-                local_observations[agent_id] = DiscordLocalObservation(
+                local_observations[agent_id] = LocalObservation(
                     agent_id=agent_id,
-                    observation=DiscordObservation(messages=[])
+                    observation=ChatObservation(messages=[])
                 )
             local_observations[agent_id].observation.messages.append(message)
 
         # Create and return global observation
-        global_observation = DiscordGlobalObservation(
+        global_observation = GlobalObservation(
             observations=local_observations,
             all_messages=self.messages
         )
@@ -142,25 +175,43 @@ class ChatMechanism(BaseModel):
         self.current_round = 0
         self.messages = []
         self.global_state = {}  # Reset global state
-        logger.info("DiscordMechanism has been reset.")
+        logger.info("ChatMechanism has been reset.")
 
-class MultiAgentEnvironment(BaseModel):
+class MultiAgentEnvironment():
     """
     Base class for multi-agent environments. With batched or sequential actions.
     """
-    name: str = Field(..., description="Name of the environment")
-    address: Optional[str] = Field(default=None, description="Address of the environment for orchestrator linking")
-    current_step: int = Field(default=0, description="Current step/round of the simulation")
-    max_steps: int = Field(default=10, description="Maximum number of steps/rounds for this environment")
-    action_space: ActionSpace = Field(default_factory=NotebookActionSpace, description="Action space of the environment")
-    observation_space: ObservationSpace = Field(default_factory=NotebookObservationSpace, description="Observation space of the environment")
-    history: EnvironmentHistory = Field(default_factory=EnvironmentHistory, description="History of environment steps")
-    mechanism: Mechanism = Field(default_factory=Notebook, description="Mechanism of the environment that determines the rules of the game P(s, a, s')")
+    def __init__(self, deployment, action_space, observation_space, history, mechanism):
+        self.deployment = deployment
+        self.storage_provider = StorageProvider(self.deployment.node)
+        self.name = self.deployment.config.config_name
+        self.address = None
+        self.max_rounds = self.deployment.config.max_rounds
+        self.current_step = 0
+        self.max_steps = 10
+        self.action_space = action_space
+        self.observation_space = observation_space
+        self.history = history
+        self.mechanism = mechanism
 
     # TODO: Remove this. In future, the create function should be called by create_module in the same way that run is called by run_module
     async def init(self, *args, **kwargs):
         await create(self.deployment)
-        return {"status": "success", "message": f"Successfully populated {self.table_name} table"}
+        return {"status": "success", "message": f"Successfully populated {self.deployment.config.storage_config.path} table"}
+
+    async def delete_table(self, input_data: Dict[str, Any], *args, **kwargs):
+        delete_table_request = DeleteStorageRequest(
+            storage_type=self.deployment.config.storage_config.storage_type,
+            path=input_data['table_name'],
+        )
+        delete_table_result = await self.storage_provider.execute(delete_table_request)
+        logger.info(f"Delete table result: {delete_table_result}")
+        return {"status": "success", "message": f"Delete table result: {delete_table_result}"}
+
+    async def update_state(self, environment_info):
+        await self.mechanism.update_state(environment_info)
+        return {"status": "success"}
+
 
     def step(self, actions: GlobalAction) -> EnvironmentStep:
         """
@@ -213,14 +264,14 @@ class MultiAgentEnvironment(BaseModel):
         """
         pass  # No specific cleanup needed for the basic environment
 
-    def get_global_state(self) -> Any:
+    async def get_global_state(self) -> Any:
         """
         Return a summary of the global state.
 
         Returns:
             Any: The global state.
         """
-        return self.mechanism.get_global_state()
+        return await self.mechanism.get_global_state()
 
     def get_current_step(self) -> int:
         """
@@ -264,22 +315,17 @@ async def create(deployment: EnvironmentDeployment):
     logger.info(f"Result: {create_table_result}")
 
 # Default entrypoint when the module is executed
-def run(module_run: Dict):
-    module_run = AgentRunInput(**module_run)
+async def run(module_run: Dict):
+    module_run = EnvironmentRunInput(**module_run)
     module_run.inputs = InputSchema(**module_run.inputs)
 
-    chat_mechanism = ChatMechanism(
-        max_rounds=module_run.deployment.config.max_rounds,
-        current_topic=module_run.deployment.config.initial_topic,
-        speaker_order=["0"]
-    )
+    chat_mechanism = ChatMechanism(module_run.deployment)
 
     environment = MultiAgentEnvironment(
-        name=module_run.deployment.config.config_name,
-        address="group_chat_address",
-        max_steps=module_run.deployment.config.max_rounds,
-        action_space=GroupChatActionSpace(),
-        observation_space=GroupChatObservationSpace(),
+        deployment = module_run.deployment,
+        action_space=ActionSpace(),
+        observation_space=ObservationSpace(),
+        history=EnvironmentHistory(),
         mechanism=chat_mechanism
     )
 
@@ -288,7 +334,10 @@ def run(module_run: Dict):
     if not method:
         raise ValueError(f"Invalid function name: {module_run.inputs.func_name}")
 
-    return await method(module_run.inputs.func_input_data)
+    if module_run.inputs.func_input_data:
+        return await method(module_run.inputs.func_input_data)
+    else:
+        return await method()
 
 if __name__ == "__main__":
     import asyncio
@@ -308,11 +357,13 @@ if __name__ == "__main__":
         "update_state": {
             "func_name": "update_state",
             "func_input_data": {
-                "run_id": "123",
+                "message_id": "123",
                 "messages": [
                     {
                         "role": "user",
-                        "content": "What is the capital of France?"
+                        "content": "What is the capital of France?",
+                        "user_id": "user:richard",
+                        "timestamp": "today"
                     }
                 ]
             },
@@ -328,12 +379,12 @@ if __name__ == "__main__":
     }
 
     module_run = {
-        "inputs": inputs_dict["init"],
+        "inputs": inputs_dict["update_state"],
         "deployment": deployment,
         "consumer_id": naptha.user.id,
         "signature": sign_consumer_id(naptha.user.id, os.getenv("PRIVATE_KEY"))
     }
 
-    response = run(module_run)
+    response = asyncio.run(run(module_run))
 
     print("Response: ", response)
